@@ -1,0 +1,191 @@
+diff --git a/mt7915/init.c b/mt7915/init.c
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -221,6 +221,11 @@
+ 	return PTR_ERR_OR_ZERO(hwmon);
+ }
+ 
++static bool mt7915_is_dirx3260(void)
++{
++return of_machine_is_compatible("dlink,dir-x3260-a1");
++}
++
+ static void mt7915_led_set_config(struct led_classdev *led_cdev,
+ 				  u8 delay_on, u8 delay_off)
+ {
+@@ -272,12 +277,35 @@
+ }
+ 
+ static void mt7915_led_set_brightness(struct led_classdev *led_cdev,
+-				      enum led_brightness brightness)
++      enum led_brightness brightness)
+ {
+-	if (!brightness)
+-		mt7915_led_set_config(led_cdev, 0, 0xff);
+-	else
+-		mt7915_led_set_config(led_cdev, 0xff, 0);
++struct mt76_phy *mphy;
++struct mt7915_dev *dev;
++
++mphy = container_of(led_cdev, struct mt76_phy, leds.cdev);
++dev = container_of(mphy->dev, struct mt7915_dev, mt76);
++
++/*
++ * DIR-X3260 A1 MT7915 5 GHz LED.
++ *
++ * The DIR-X3260 DTS uses led-sources = <26>.
++ * OEM firmware routes source 26 through the MT7915 MCU LED engine.
++ *
++ * Runtime verified:
++ *   op 1 = CONTROL=0 = OFF
++ *   op 3 = CONTROL=1 = ON
++ */
++if (is_mt7915(&dev->mt76) &&
++    mphy == &dev->mt76.phy &&
++    mt7915_is_dirx3260()) {
++mt7915_mcu_dirx3260_led_oem(dev, brightness ? 3 : 1);
++return;
++}
++
++if (!brightness)
++mt7915_led_set_config(led_cdev, 0, 0xff);
++else
++mt7915_led_set_config(led_cdev, 0xff, 0);
+ }
+ 
+ static void __mt7915_init_txpower(struct mt7915_phy *phy,
+@@ -847,6 +875,23 @@
+ 	if (ret)
+ 		return ret;
+ 
++/*
++ * DIR-X3260 A1 MT7915 5 GHz LED routing.
++ *
++ * OEM runtime-verified mapping:
++ *   02 05 01 00 00 34 00 00
++ *
++ * Send only after MCU initialization has completed.
++ * LED failure must not abort Wi-Fi initialization.
++ */
++if (is_mt7915(&dev->mt76) && mt7915_is_dirx3260()) {
++ret = mt7915_mcu_dirx3260_led_oem(dev, 0);
++if (ret)
++dev_warn(dev->mt76.dev,
++ "DIR-X3260 5G LED MAP failed: %d\n", ret);
++}
++
++
+ 	ret = mt7915_eeprom_init(dev);
+ 	if (ret < 0)
+ 		return ret;
+diff --git a/mt7915/main.c b/mt7915/main.c
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -7,6 +7,7 @@
+ #include <linux/module.h>
+ #include "mt7915.h"
+ #include "mcu.h"
++#include <linux/of.h>
+ 
+ static bool mt7915_dev_running(struct mt7915_dev *dev)
+ {
+@@ -710,6 +711,15 @@
+ 	if (err)
+ 		goto out;
+ 	err = mt7915_mcu_add_sta(dev, vif, NULL, CONN_STATE_PORT_SECURE, false);
++
++	/*
++	 * DIR-X3260: replay the runtime-verified OEM 5 GHz LED
++	 * CONTROL=1 command after AP/BSS/STA setup succeeds.
++	 */
++	if (!err &&
++	    is_mt7915(&dev->mt76) &&
++	    of_machine_is_compatible("dlink,dir-x3260-a1"))
++		mt7915_mcu_dirx3260_led_oem(dev, 3);
+ out:
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -4203,3 +4203,69 @@
+ 
+ 	return 0;
+ }
++
++/*
++ * DIR-X3260 A1 MT7915 5 GHz LED MCU backend.
++ *
++ * Runtime-verified OEM commands:
++ *   op 0 = LED source map
++ *   op 1 = CONTROL=0 / OFF
++ *   op 2 = OEM LED enhance configuration
++ *   op 3 = CONTROL=1 / ON
++ *
++ * The board-specific callers initialize the LED map after MCU
++ * startup and replay CONTROL=1 after successful AP startup.
++ */
++int mt7915_mcu_dirx3260_led_oem(struct mt7915_dev *dev, u8 op)
++{
++static const u8 map_req[8] = {
++0x02, 0x05, 0x01, 0x00,
++0x00, 0x34, 0x00, 0x00,
++};
++static const u8 op1_req[8] = {
++0x02, 0x01, 0x01, 0x00,
++0x00, 0x00, 0x00, 0x00,
++};
++static const u8 op2_req[20] = {
++0x02, 0x02, 0x01, 0x00,
++0x00, 0x00, 0x00, 0x00,
++0x00, 0x02, 0x00, 0x00,
++0x46, 0x00, 0x1e, 0x00,
++0x00, 0x00, 0x00, 0x00,
++};
++static const u8 op1_control1_req[8] = {
++0x02, 0x01, 0x01, 0x01,
++0x00, 0x00, 0x00, 0x00,
++};
++
++const void *req;
++size_t len;
++int cmd;
++
++switch (op) {
++case 0:
++req = map_req;
++len = sizeof(map_req);
++break;
++case 1:
++req = op1_req;
++len = sizeof(op1_req);
++break;
++case 2:
++req = op2_req;
++len = sizeof(op2_req);
++break;
++case 3:
++req = op1_control1_req;
++len = sizeof(op1_control1_req);
++break;
++default:
++return -EINVAL;
++}
++
++cmd = MCU_CMD(EXT_CID) |
++      FIELD_PREP(__MCU_CMD_FIELD_EXT_ID, 0x17);
++
++return mt76_mcu_send_msg(&dev->mt76, cmd, req, len, true);
++}
++
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -451,6 +451,7 @@
+ void mt7915_init_txpower(struct mt7915_phy *phy);
+ void mt7915_reset(struct mt7915_dev *dev);
+ int mt7915_run(struct ieee80211_hw *hw);
++int mt7915_mcu_dirx3260_led_oem(struct mt7915_dev *dev, u8 op);
+ int mt7915_mcu_init(struct mt7915_dev *dev);
+ int mt7915_mcu_init_firmware(struct mt7915_dev *dev);
+ int mt7915_mcu_twt_agrt_update(struct mt7915_dev *dev,
