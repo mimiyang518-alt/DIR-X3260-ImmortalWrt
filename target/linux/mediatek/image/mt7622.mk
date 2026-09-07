@@ -539,3 +539,25 @@ endif
   DEVICE_COMPAT_MESSAGE := Flash layout changes require a manual reinstall using factory.bin.
 endef
 TARGET_DEVICES += xiaomi_redmi-router-ax6s
+
+define Device/dlink_dir-x3260-a1
+  DEVICE_VENDOR := D-Link
+  DEVICE_MODEL := DIR-X3260
+  DEVICE_VARIANT := A1
+  DEVICE_DTS := mt7622-dlink-dir-x3260-a1
+  DEVICE_DTS_DIR := ../dts
+  DEVICE_PACKAGES := kmod-mt7915-firmware
+  BLOCKSIZE := 128k
+  PAGESIZE := 2048
+  KERNEL_SIZE := 8192k
+  IMAGE_SIZE := 40960k
+  UBINIZE_OPTS := -E 5
+  KERNEL := kernel-bin | lzma | fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb | pad-offset $$(PAGESIZE) 0 | append-squashfs4-fakeroot
+  IMAGES += recovery.bin
+  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+  IMAGE/recovery.bin := append-kernel | pad-to $$(KERNEL_SIZE) | \
+    append-ubi | pad-to 20736k | \
+    append-dlink-covr-metadata $$(DEVICE_MODEL) | check-size
+endef
+
+TARGET_DEVICES += dlink_dir-x3260-a1
