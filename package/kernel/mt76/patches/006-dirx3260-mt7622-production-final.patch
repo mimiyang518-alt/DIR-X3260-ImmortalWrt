@@ -1,0 +1,199 @@
+diff --git a/mt7615/dma.c b/mt7615/dma.c
+index 59d2b3e8..bdd836b7 100644
+--- a/mt7615/dma.c
++++ b/mt7615/dma.c
+@@ -242,6 +242,14 @@ int mt7615_dma_init(struct mt7615_dev *dev)
+ 	mt76_rmw_field(dev, MT_WPDMA_GLO_CFG,
+ 		       MT_WPDMA_GLO_CFG_MULTI_DMA_EN, 0x3);
+ 
++	/*
++	 * DIR-X3260 / MT7622 OEM WPDMA initialization:
++	 * keep WPDMA clock ungated.
++	 */
++	if (is_mt7622(&dev->mt76))
++		mt76_set(dev, MT_WPDMA_GLO_CFG,
++			 MT_WPDMA_GLO_CFG_CLK_GATE_DIS);
++
+ 	if (is_mt7615(&dev->mt76)) {
+ 		mt76_set(dev, MT_WPDMA_GLO_CFG,
+ 			 MT_WPDMA_GLO_CFG_FIRST_TOKEN_ONLY);
+@@ -255,6 +263,9 @@ int mt7615_dma_init(struct mt7615_dev *dev)
+ 		mt76_clear(dev, 0x7000, BIT(23));
+ 	}
+ 
++	if (is_mt7622(&dev->mt76))
++		mt76_wr(dev, MT_WPDMA_RX_PRE_CFG, 0xf7f0000);
++
+ 	mt76_wr(dev, MT_WPDMA_RST_IDX, ~0);
+ 
+ 	ret = mt7615_init_tx_queues(dev);
+diff --git a/mt7615/mcu.c b/mt7615/mcu.c
+index ff57ede8..03c66d85 100644
+--- a/mt7615/mcu.c
++++ b/mt7615/mcu.c
+@@ -113,7 +113,11 @@ void mt7615_mcu_fill_msg(struct mt7615_dev *dev, struct sk_buff *skb,
+ 
+ 	mcu_txd = (struct mt7615_mcu_txd *)txd;
+ 	mcu_txd->len = cpu_to_le16(skb->len - sizeof(mcu_txd->txd));
+-	mcu_txd->pq_id = cpu_to_le16(MCU_PQ_ID(MT_TX_PORT_IDX_MCU, q_idx));
++	if (is_mt7622(&dev->mt76) && cmd != MCU_CMD(FW_SCATTER))
++		mcu_txd->pq_id = cpu_to_le16(0x8000);
++	else
++		mcu_txd->pq_id =
++			cpu_to_le16(MCU_PQ_ID(MT_TX_PORT_IDX_MCU, q_idx));
+ 	mcu_txd->s2d_index = MCU_S2D_H2N;
+ 	mcu_txd->pkt_type = MCU_PKT_ID;
+ 	mcu_txd->seq = seq;
+@@ -229,12 +233,36 @@ int mt7615_rf_wr(struct mt7615_dev *dev, u32 wf, u32 reg, u32 val)
+ 
+ void mt7622_trigger_hif_int(struct mt7615_dev *dev, bool en)
+ {
++	void __iomem *reg;
++	u32 val;
++
+ 	if (!is_mt7622(&dev->mt76))
+ 		return;
+ 
+-	regmap_update_bits(dev->infracfg, MT_INFRACFG_MISC,
+-			   MT_INFRACFG_MISC_AP2CONN_WAKE,
+-			   !en * MT_INFRACFG_MISC_AP2CONN_WAKE);
++	/*
++	 * DIR-X3260 MT7622 OEM trigger:
++	 * physical 0x10000700, BIT(1).
++	 */
++	reg = ioremap(0x10000700, 0x10);
++	if (!reg) {
++		dev_err(dev->mt76.dev,
++			"DIRX3260 OEMTRIG: ioremap failed\n");
++		return;
++	}
++
++	val = readl_relaxed(reg);
++	asm volatile("dsb ld" : : : "memory");
++
++	if (en)
++		val |= BIT(1);
++	else
++		val &= ~BIT(1);
++
++	asm volatile("dsb st" : : : "memory");
++	writel_relaxed(val, reg);
++	asm volatile("dsb sy" : : : "memory");
++
++	iounmap(reg);
+ }
+ EXPORT_SYMBOL_GPL(mt7622_trigger_hif_int);
+ 
+@@ -256,13 +284,23 @@ static int mt7615_mcu_drv_pmctrl(struct mt7615_dev *dev)
+ 		addr = MT_CFG_LPCR_HOST;
+ 	}
+ 
+-	mt76_wr(dev, addr, MT_CFG_LPCR_HOST_DRV_OWN);
+-
+-	mt7622_trigger_hif_int(dev, true);
+-
+-	err = !mt76_poll_msec(dev, addr, MT_CFG_LPCR_HOST_FW_OWN, 0, 3000);
+-
+-	mt7622_trigger_hif_int(dev, false);
++	if (is_mt7622(mdev)) {
++		/*
++		 * DIR-X3260 / MT7622 OEM DriverOwn:
++		 * AP2CONN_WAKE = 1
++		 * LPCR = BIT(0)
++		 * wait BIT(0) == BIT(0)
++		 * AP2CONN_WAKE = 0
++		 */
++		mt7622_trigger_hif_int(dev, true);
++		mt76_wr(dev, addr, BIT(0));
++		err = !mt76_poll_msec(dev, addr, BIT(0), BIT(0), 3000);
++		mt7622_trigger_hif_int(dev, false);
++	} else {
++		mt76_wr(dev, addr, MT_CFG_LPCR_HOST_DRV_OWN);
++		err = !mt76_poll_msec(dev, addr,
++				     MT_CFG_LPCR_HOST_FW_OWN, 0, 3000);
++	}
+ 
+ 	if (err) {
+ 		dev_err(mdev->dev, "driver own failed\n");
+@@ -324,20 +362,31 @@ static int mt7615_mcu_fw_pmctrl(struct mt7615_dev *dev)
+ 	if (mt76_connac_skip_fw_pmctrl(mphy, pm))
+ 		goto out;
+ 
+-	mt7622_trigger_hif_int(dev, true);
+-
+-	addr = is_mt7663(&dev->mt76) ? MT_CONN_HIF_ON_LPCTL : MT_CFG_LPCR_HOST;
+-	mt76_wr(dev, addr, MT_CFG_LPCR_HOST_FW_OWN);
++	addr = is_mt7663(&dev->mt76) ?
++	       MT_CONN_HIF_ON_LPCTL : MT_CFG_LPCR_HOST;
++
++	if (is_mt7622(&dev->mt76)) {
++		/*
++		 * DIR-X3260 / MT7622 OEM FirmwareOwn:
++		 * AP2CONN_WAKE = 1
++		 * LPCR = BIT(1)
++		 * wait BIT(0) == 0
++		 * AP2CONN_WAKE = 0
++		 */
++		mt7622_trigger_hif_int(dev, true);
++		mt76_wr(dev, addr, BIT(1));
++
++		if (!mt76_poll_msec(dev, addr, BIT(0), 0, 3000)) {
++			dev_err(dev->mt76.dev,
++				"Timeout for firmware own\n");
++			clear_bit(MT76_STATE_PM, &mphy->state);
++			err = -EIO;
++		}
+ 
+-	if (is_mt7622(&dev->mt76) &&
+-	    !mt76_poll_msec(dev, addr, MT_CFG_LPCR_HOST_FW_OWN,
+-			    MT_CFG_LPCR_HOST_FW_OWN, 3000)) {
+-		dev_err(dev->mt76.dev, "Timeout for firmware own\n");
+-		clear_bit(MT76_STATE_PM, &mphy->state);
+-		err = -EIO;
++		mt7622_trigger_hif_int(dev, false);
++	} else {
++		mt76_wr(dev, addr, MT_CFG_LPCR_HOST_FW_OWN);
+ 	}
+-
+-	mt7622_trigger_hif_int(dev, false);
+ 	if (!err) {
+ 		pm->stats.last_doze_event = jiffies;
+ 		pm->stats.awake_time += pm->stats.last_doze_event -
+diff --git a/mt7615/regs.h b/mt7615/regs.h
+index e4133e91..8392d654 100644
+--- a/mt7615/regs.h
++++ b/mt7615/regs.h
+@@ -130,6 +130,7 @@ enum mt7615_reg_base {
+ #define MT_WPDMA_GLO_CFG_SW_RESET	BIT(24)
+ #define MT_WPDMA_GLO_CFG_FIRST_TOKEN_ONLY	BIT(26)
+ #define MT_WPDMA_GLO_CFG_OMIT_TX_INFO	BIT(28)
++#define MT_WPDMA_GLO_CFG_CLK_GATE_DIS	BIT(30)
+ 
+ #define MT_WPDMA_RST_IDX		MT_HIF(0x20c)
+ 
+diff --git a/mt7615/soc.c b/mt7615/soc.c
+index 4bd189dd..52deff8d 100644
+--- a/mt7615/soc.c
++++ b/mt7615/soc.c
+@@ -26,6 +26,21 @@ int mt7622_wmac_init(struct mt7615_dev *dev)
+ 		return PTR_ERR(dev->infracfg);
+ 	}
+ 
++	/*
++	 * DIR-X3260 OEM MT7622 subsys-ioc WiFi setting:
++	 * infracfg 0x320 BIT(31).
++	 */
++	{
++		int ret;
++
++		ret = regmap_update_bits(dev->infracfg, 0x320,
++					 BIT(31), BIT(31));
++		if (ret)
++			dev_warn(dev->mt76.dev,
++				 "DIRX3260: IOC 10000320 update failed=%d\n",
++				 ret);
++	}
++
+ 	return 0;
+ }
+ 
