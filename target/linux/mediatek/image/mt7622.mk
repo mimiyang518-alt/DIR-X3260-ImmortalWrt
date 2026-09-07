@@ -52,6 +52,18 @@ define Build/mt7622-gpt
 	rm $@.tmp
 endef
 
+define Build/append-dlink-covr-metadata
+	# workaround pad-to adding 8 more bytes for no reason
+	echo -ne '\x00\x00\x00\x00' >> $@
+	echo -ne '{"supported_devices":"$(1)", "firmware": "' > $@metadata.tmp
+	$(MKHASH) md5 "$@" | head -c32 >> $@metadata.tmp
+	echo '"}' >> $@metadata.tmp
+	# add null space to fill the remainder of the json that we don't populate
+	$(call Image/pad-to,$@metadata.tmp,320)
+	fwtool -I $@metadata.tmp $@
+	rm $@metadata.tmp
+endef
+
 define Device/asiarf_ap7622-wh1
   DEVICE_VENDOR := AsiaRF
   DEVICE_MODEL := AP7622-WH1
