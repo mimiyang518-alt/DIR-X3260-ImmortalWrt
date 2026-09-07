@@ -1,0 +1,61 @@
+#!/bin/sh
+
+. /lib/functions.sh
+
+board="$(board_name)"
+
+[ "$board" = "dlink,dir-x3260-a1" ] || exit 0
+
+radio2g=""
+radio5g=""
+
+find_radios()
+{
+local section="$1"
+local band
+
+config_get band "$section" band
+
+case "$band" in
+2g)
+radio2g="$section"
+;;
+5g)
+radio5g="$section"
+;;
+esac
+}
+
+set_wifi_defaults()
+{
+local section="$1"
+local device
+
+config_get device "$section" device
+
+case "$device" in
+"$radio2g")
+uci set wireless."$section".ssid='OpenWRT'
+uci -q delete wireless."$section".disabled
+;;
+"$radio5g")
+uci set wireless."$section".ssid='OpenWRT-5G'
+uci -q delete wireless."$section".disabled
+;;
+esac
+}
+
+config_load wireless
+config_foreach find_radios wifi-device
+
+[ -n "$radio2g" ] &&
+uci -q delete wireless."$radio2g".disabled
+
+[ -n "$radio5g" ] &&
+uci -q delete wireless."$radio5g".disabled
+
+config_foreach set_wifi_defaults wifi-iface
+
+uci commit wireless
+
+exit 0
